@@ -3,7 +3,7 @@
   "version": "0.2.0",
   "author": {
     "name": "responsedotok",
-    "url": "git+https://github.com/adam-robson/shufffle.git"
+    "url": "git+https://github.com/Adam-Robson/shufffle.git"
   },
   "description": "A zero-dependency & config-driven reverse proxy for Node.js. Define routes and upstreams in JSON, run it from the CLI, or embed it in your own server.",
   "keywords": [
@@ -25,7 +25,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/adam-robson/shufffle.git"
+    "url": "git+https://github.com/Adam-Robson/shufffle.git"
   },
   "exports": {
     ".": {
