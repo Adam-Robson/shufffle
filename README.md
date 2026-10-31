@@ -85,6 +85,7 @@ await proxy.listen();
 - Path rewrites (e.g. `stripPrefix`)
 - Per-route and global header rules
 - Configurable timeouts, max body size, and `X-Forwarded-For` forwarding
+- WebSocket proxying, with `onRequest` hooks applied to upgrades as well as HTTP requests
 
 ## License
 
