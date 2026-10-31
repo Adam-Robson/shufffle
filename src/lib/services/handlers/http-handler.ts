@@ -129,6 +129,11 @@ export class HttpHandler {
     return new Promise((resolve) => {
       const { req, res, upstream, targetPath, route } = ctx;
 
+      if (req.socket.destroyed) {
+        resolve();
+        return;
+      }
+
       const protocol = upstream.protocol ?? 'http';
       const transport = protocol === 'https' ? https : http;
 
@@ -148,6 +153,38 @@ export class HttpHandler {
         agent: protocol === 'https' ? this.httpsAgent : this.httpAgent,
       };
 
+      let settled = false;
+      let bodyTooLarge = false;
+      let bodyConsumed = false;
+
+      /**
+       * Claim the outcome of this attempt. Destroying the upstream request
+       * emits further errors, so only the first caller may act on it.
+       */
+      const settle = (): boolean => {
+        if (settled) return false;
+        settled = true;
+        res.off('close', onClientClose);
+        req.off('error', fail);
+        return true;
+      };
+
+      const fail = (err: unknown): void => {
+        if (!settle()) return;
+        proxyReq.destroy();
+        this.handleError(
+          err instanceof Error ? err : new Error(String(err)),
+          ctx,
+          res,
+        ).then(resolve);
+      };
+
+      const onClientClose = (): void => {
+        if (res.writableFinished || !settle()) return;
+        proxyReq.destroy();
+        resolve();
+      };
+
       const proxyReq = transport.request(options, (proxyRes) => {
         res.statusCode = proxyRes.statusCode ?? 502;
 
@@ -157,46 +194,34 @@ export class HttpHandler {
 
         this.headersService.applyResponseHeaders(res, route.headers);
 
-        proxyRes.on('error', (err) => {
-          this.handleError(err, ctx, res).then(resolve);
-        });
+        proxyRes.on('error', fail);
 
-        if (this.hooks.onResponse) {
-          Promise.resolve(this.hooks.onResponse(ctx, res.statusCode)).then(
-            () => {
-              proxyRes.pipe(res, { end: true });
-              proxyRes.on('end', resolve);
-            },
-            (err) =>
-              this.handleError(
-                err instanceof Error ? err : new Error(String(err)),
-                ctx,
-                res,
-              ).then(resolve),
-          );
-        } else {
-          proxyRes.pipe(res, { end: true });
-          proxyRes.on('end', resolve);
-        }
+        Promise.resolve()
+          .then(() => this.hooks.onResponse?.(ctx, res.statusCode))
+          .then(() => {
+            if (settled) return;
+            proxyRes.on('end', () => {
+              settle();
+              resolve();
+            });
+            proxyRes.pipe(res, { end: true });
+          }, fail);
       });
 
       proxyReq.on('timeout', () => {
-        proxyReq.destroy();
-        this.handleError(
+        fail(
           new Error(
             `Upstream request timed out ${upstream.host}:${upstream.port}`,
           ),
-          ctx,
-          res,
-        ).then(resolve);
+        );
       });
 
-      let bodyTooLarge = false;
-      let bodyConsumed = false;
-
       proxyReq.on('error', (err) => {
+        if (settled) return;
+
         if (bodyTooLarge) {
-          if (!res.headersSent) this.sendError(res, 413, 'Payload Too Large');
+          settle();
+          this.sendError(res, 413, 'Payload Too Large');
           resolve();
           return;
         }
@@ -212,6 +237,7 @@ export class HttpHandler {
             healthyRemaining.length > 0 ? healthyRemaining : remaining;
 
           if (candidates.length > 0) {
+            settle();
             const balancer = this.getBalancer(route);
             const nextUpstream = balancer.pick(candidates);
             const nextCtx = { ...ctx, upstream: nextUpstream };
@@ -220,12 +246,11 @@ export class HttpHandler {
           }
         }
 
-        this.handleError(err, ctx, res).then(resolve);
+        fail(err);
       });
 
-      req.on('error', (err) => {
-        this.handleError(err, ctx, res).then(resolve);
-      });
+      res.on('close', onClientClose);
+      req.on('error', fail);
 
       const maxBodySize = route.maxBodySize ?? this.config.maxBodySize;
       let bodyBytes = 0;
@@ -286,7 +311,11 @@ export class HttpHandler {
     ctx: Partial<Context>,
     res: ServerResponse,
   ): Promise<void> {
-    if (!res.headersSent) {
+    if (res.headersSent) {
+      // Too late for a status code; cutting the connection is the only way
+      // to tell the client that the response is incomplete.
+      res.destroy();
+    } else {
       this.sendError(res, 502, 'Bad Gateway');
     }
     try {
@@ -304,6 +333,8 @@ export class HttpHandler {
     message: string,
   ): void {
     if (res.headersSent) return;
+    // Headers copied from the upstream, like content-length, don't describe this body.
+    for (const name of res.getHeaderNames()) res.removeHeader(name);
     res.writeHead(status, { 'content-type': 'text/plain' });
     res.end(`${status} ${message}`);
   }

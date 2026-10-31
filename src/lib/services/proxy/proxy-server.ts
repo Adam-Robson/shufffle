@@ -39,7 +39,11 @@ export class ProxyServer {
       headersService,
       this.logger,
     );
-    this.wsHandler = new WebSocketHandler(this.httpHandler, headersService);
+    this.wsHandler = new WebSocketHandler(
+      this.httpHandler,
+      headersService,
+      hooks,
+    );
 
     this.server = http.createServer((req, res) => {
       this.httpHandler.handler(req, res).catch(async (err) => {
@@ -118,7 +122,8 @@ export class ProxyServer {
    * Gracefully shut down the server.
    *
    * Stops health-check probes, closes idle connections immediately,
-   * and force-closes remaining connections after {@link drainTimeoutMs}.
+   * and force-closes remaining connections, including WebSocket tunnels,
+   * after {@link drainTimeoutMs}.
    */
   close(drainTimeoutMs = 10_000): Promise<void> {
     return new Promise((resolve, reject) => {
@@ -128,6 +133,7 @@ export class ProxyServer {
 
       const timer = setTimeout(() => {
         this.server.closeAllConnections();
+        this.wsHandler.destroyAll();
       }, drainTimeoutMs);
       timer.unref();
 
