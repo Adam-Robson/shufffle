@@ -3,51 +3,103 @@ import net from 'node:net';
 import tls from 'node:tls';
 import { matchRoute } from '../../../utils/match-route.js';
 import { rewritePath } from '../../../utils/rewrite-path.js';
+import type { Hooks } from '../../types/hooks.js';
+import type { Route } from '../../types/route.js';
+import type { Upstream } from '../../types/upstream.js';
 import type { HeadersService } from '../headers/headers-service.js';
 import type { HttpHandler } from './http-handler.js';
 
 export class WebSocketHandler {
+  private readonly sockets = new Set<net.Socket>();
+
   constructor(
     private readonly httpHandler: HttpHandler,
     private readonly headersService: HeadersService,
+    private readonly hooks: Hooks = {},
   ) {}
 
   /**
-   * Tunnel a WebSocket upgrade between the client socket and a chosen
-   * upstream. Resolves once the upstream connection is established and
-   * piping has been wired; rejects on any error along the way.
+   * Destroy every tracked client socket. `http.Server` no longer owns a
+   * socket once it has been upgraded, so `closeAllConnections()` misses them.
+   */
+  destroyAll(): void {
+    for (const socket of this.sockets) socket.destroy();
+  }
+
+  /**
+   * Run the `onRequest` hook, then tunnel a WebSocket upgrade between the
+   * client socket and a chosen upstream. Resolves once the upstream
+   * connection is established and piping has been wired, or once the hook
+   * has denied the upgrade; rejects on any error along the way.
    *
    * On rejection the handler has already responded to the client (502 +
    * destroy) and cleaned up; the caller's only job is to surface the
    * error (logs, hooks).
    */
-  upgrade(
+  async upgrade(
     req: IncomingMessage,
     socket: net.Socket,
     head: Buffer,
   ): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
-      const { config } = this.httpHandler;
-      const url = new URL(req.url ?? '/', 'http://localhost');
-      const route = matchRoute(config.routes, url.pathname);
+    this.sockets.add(socket);
+    socket.once('close', () => this.sockets.delete(socket));
 
-      if (!route || route.upstreams.length === 0) {
+    const { config } = this.httpHandler;
+    const url = new URL(req.url ?? '/', 'http://localhost');
+    const route = matchRoute(config.routes, url.pathname);
+
+    if (!route || route.upstreams.length === 0) {
+      this.fail(socket, 502, 'Bad Gateway');
+      throw new Error(
+        route
+          ? `No upstreams configured for route '${url.pathname}'`
+          : `No matching route for WebSocket upgrade '${url.pathname}'`,
+      );
+    }
+
+    const candidates = this.httpHandler.healthyCandidates(route.upstreams);
+    const upstream = this.httpHandler.getBalancer(route).pick(candidates);
+    const targetPath =
+      rewritePath(url.pathname, route.rewrite) + (url.search ?? '');
+
+    if (this.hooks.onRequest) {
+      // Node removes its socket error listener on upgrade, so an error
+      // while the hook is pending would otherwise be uncaught.
+      socket.on('error', () => socket.destroy());
+
+      let proceed: boolean;
+      try {
+        proceed = await this.hooks.onRequest({
+          req,
+          route,
+          upstream,
+          targetPath,
+        });
+      } catch (err) {
         this.fail(socket, 502, 'Bad Gateway');
-        reject(
-          new Error(
-            route
-              ? `No upstreams configured for route '${url.pathname}'`
-              : `No matching route for WebSocket upgrade '${url.pathname}'`,
-          ),
-        );
-        return;
+        throw err instanceof Error ? err : new Error(String(err));
       }
 
-      const candidates = this.httpHandler.healthyCandidates(route.upstreams);
-      const upstream = this.httpHandler.getBalancer(route).pick(candidates);
+      if (!proceed) {
+        this.fail(socket, 403, 'Forbidden');
+        return;
+      }
+      if (socket.destroyed) return;
+    }
 
-      const targetPath =
-        rewritePath(url.pathname, route.rewrite) + (url.search ?? '');
+    await this.tunnel(req, socket, head, route, upstream, targetPath);
+  }
+
+  private tunnel(
+    req: IncomingMessage,
+    socket: net.Socket,
+    head: Buffer,
+    route: Route,
+    upstream: Upstream,
+    targetPath: string,
+  ): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const { config } = this.httpHandler;
       const upgradeHeaders = this.headersService.buildUpgradeHeaders(
         req,
         route.headers,

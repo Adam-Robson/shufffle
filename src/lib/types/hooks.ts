@@ -9,7 +9,7 @@ import type { Context } from './context.js';
  *   - the route being handled,
  *   - the upstream server,
  *   - the target path
- *  @property {function} [onRequest] - Called prior to proxying the request. Returns false to cancel request.
+ *  @property {function} [onRequest] - Called prior to proxying the request, including WebSocket upgrades. Returns false to cancel request.
  *  @property {function} [onResponse] - Called after the response is received from upstream.
  *  @property {function} [onError] - Called when an error occurs during request handling. Receives the error object as a second argument.
  *
